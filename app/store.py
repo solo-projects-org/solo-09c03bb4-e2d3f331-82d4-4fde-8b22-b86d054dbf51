@@ -30,6 +30,7 @@ import os
 import sqlite3
 import threading
 from datetime import datetime, timezone
+from typing import Optional
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -62,6 +63,24 @@ CREATE TABLE IF NOT EXISTS current_groups (
     old_total_cents INTEGER NOT NULL,
     new_total_cents INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS forms (
+    form_no         TEXT PRIMARY KEY,
+    year            INTEGER NOT NULL,
+    tax_codes_json  TEXT    NOT NULL,
+    total_cents     INTEGER NOT NULL,
+    status          TEXT    NOT NULL CHECK (status IN ('active', 'revoked')),
+    registered_at   TEXT    NOT NULL,
+    revoked_at      TEXT
+);
+CREATE TABLE IF NOT EXISTS vouchers (
+    voucher_no       TEXT PRIMARY KEY,
+    version          INTEGER NOT NULL,
+    group_id         INTEGER NOT NULL,
+    year             INTEGER NOT NULL,
+    form_nos_json    TEXT    NOT NULL,
+    total_cents      INTEGER NOT NULL,
+    issued_at        TEXT    NOT NULL
+);
 """
 
 MAX_REPORTED = 20  # cap on code lists inside validation error payloads
@@ -92,6 +111,50 @@ def _member_hash(old_codes, new_codes) -> str:
 def _content_hash(pairs) -> str:
     payload = json.dumps(pairs, ensure_ascii=False, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _exact_cover(candidates, target):
+    """Smallest exact cover of ``target`` by candidate forms.
+
+    ``candidates`` is an iterable of ``(form_no, code_set)``; every chosen
+    form is used whole, chosen forms must be pairwise code-disjoint and their
+    union must equal ``target`` exactly.  Returns the tuple of form numbers of
+    the cover using the fewest forms, breaking ties by lexicographically
+    smallest form-number tuple; returns ``None`` when no cover exists.
+    """
+    target = set(target)
+    # Forms are used whole, so a form carrying any code outside the target
+    # group can never participate in an exact cover and is discarded upfront.
+    # Deterministic order also makes the first minimum found the lex-smallest.
+    forms = sorted(
+        ((no, set(codes)) for no, codes in candidates if set(codes) <= target),
+        key=lambda item: item[0],
+    )
+    n = len(forms)
+    best: Optional[tuple] = None
+    current: list[str] = []
+
+    def search(remaining: set[str]):
+        nonlocal best
+        if best is not None and len(current) >= len(best):
+            return  # cannot beat the incumbent on cardinality
+        if not remaining:
+            best = tuple(current)
+            return
+        # Branch on one representative uncovered code: every valid cover must
+        # pick exactly one form containing it.  Forms overlapping earlier picks
+        # are excluded by the ``codes <= remaining`` check.
+        needed = min(remaining)
+        for i in range(n):
+            no, codes = forms[i]
+            if needed not in codes or not codes <= remaining:
+                continue
+            current.append(no)
+            search(remaining - codes)
+            current.pop()
+
+    search(set(target))
+    return best
 
 
 def _components(pairs):
@@ -432,3 +495,361 @@ class Store:
                     for r in rows
                 ],
             }
+
+    # ------------------------------------------------------------- 核验单
+    @staticmethod
+    def _form_out(row):
+        return {
+            "form_no": row["form_no"],
+            "year": row["year"],
+            "tax_codes": json.loads(row["tax_codes_json"]),
+            "total_cents": row["total_cents"],
+            "status": row["status"],
+            "registered_at": row["registered_at"],
+            "revoked_at": row["revoked_at"],
+        }
+
+    def _base_amounts(self, year, codes):
+        placeholders = ",".join("?" for _ in codes)
+        return {
+            r["code"]: r["amount_cents"]
+            for r in self._conn.execute(
+                f"SELECT code, amount_cents FROM amounts "
+                f"WHERE year = ? AND code IN ({placeholders})",
+                (year, *codes),
+            ).fetchall()
+        }
+
+    def register_form(self, form_no, year, tax_codes, total_cents):
+        """Register a verification form; its total must match the base table."""
+        with self._lock:
+            years = self.get_years()
+            if years is None:
+                raise ApiError(409, "base amounts must be loaded before registering forms")
+            if year not in years:
+                raise ApiError(
+                    422,
+                    {
+                        "message": "year must be one of the base-table years",
+                        "year": year,
+                        "base_years": years,
+                    },
+                )
+            duplicates = sorted({c for c in tax_codes if tax_codes.count(c) > 1})
+            if duplicates:
+                raise ApiError(
+                    422, {"message": "tax_codes must be distinct", "duplicates": duplicates}
+                )
+            base = self._base_amounts(year, tax_codes)
+            unknown = sorted(set(tax_codes) - base.keys())
+            if unknown:
+                raise ApiError(
+                    422,
+                    {
+                        "message": "every tax code must exist in the base table for that year",
+                        "unknown_tax_codes": unknown,
+                    },
+                )
+            expected = sum(base.values())
+            if total_cents != expected:
+                raise ApiError(
+                    422,
+                    {
+                        "message": "total_cents does not match the base table",
+                        "expected_total_cents": expected,
+                        "submitted_total_cents": total_cents,
+                    },
+                )
+            if self._conn.execute(
+                "SELECT 1 FROM forms WHERE form_no = ?", (form_no,)
+            ).fetchone():
+                raise ApiError(409, f"form_no {form_no!r} is already registered")
+
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._conn.execute(
+                    "INSERT INTO forms(form_no, year, tax_codes_json, total_cents, "
+                    "status, registered_at, revoked_at) VALUES(?, ?, ?, ?, 'active', ?, NULL)",
+                    (form_no, year, json.dumps(tax_codes), total_cents, _now()),
+                )
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+            row = self._conn.execute(
+                "SELECT * FROM forms WHERE form_no = ?", (form_no,)
+            ).fetchone()
+            return self._form_out(row)
+
+    def revoke_form(self, form_no):
+        """Revoke a form.  The row is kept (soft delete); repeat calls are fine."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM forms WHERE form_no = ?", (form_no,)
+            ).fetchone()
+            if row is None:
+                raise ApiError(404, f"form_no {form_no!r} not found")
+            if row["status"] == "active":
+                self._conn.execute("BEGIN IMMEDIATE")
+                try:
+                    self._conn.execute(
+                        "UPDATE forms SET status = 'revoked', revoked_at = ? WHERE form_no = ?",
+                        (_now(), form_no),
+                    )
+                    self._conn.execute("COMMIT")
+                except Exception:
+                    self._conn.execute("ROLLBACK")
+                    raise
+            return self._form_out(
+                self._conn.execute(
+                    "SELECT * FROM forms WHERE form_no = ?", (form_no,)
+                ).fetchone()
+            )
+
+    def list_forms(self, status: Optional[str] = None):
+        with self._lock:
+            if status is not None:
+                rows = self._conn.execute(
+                    "SELECT * FROM forms WHERE status = ? ORDER BY form_no", (status,)
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT * FROM forms ORDER BY form_no"
+                ).fetchall()
+            return {"forms": [self._form_out(r) for r in rows]}
+
+    def get_form(self, form_no):
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM forms WHERE form_no = ?", (form_no,)
+            ).fetchone()
+            if row is None:
+                raise ApiError(404, f"form_no {form_no!r} not found")
+            return self._form_out(row)
+
+    # --------------------------------------------------------------- 凭证
+    def _resolve_group(self, group_id, year):
+        """Return the group row and its member codes for the given year."""
+        years = self.get_years()
+        if years is None:
+            raise ApiError(409, "base amounts must be loaded before issuing vouchers")
+        if year not in years:
+            raise ApiError(
+                422,
+                {
+                    "message": "year must be one of the base-table years",
+                    "year": year,
+                    "base_years": years,
+                },
+            )
+        row = self._conn.execute(
+            "SELECT * FROM current_groups WHERE group_id = ?", (group_id,)
+        ).fetchone()
+        if row is None:
+            raise ApiError(
+                422,
+                {
+                    "message": "group_id not found in the current mapping version",
+                    "group_id": group_id,
+                },
+            )
+        side = "old_codes_json" if year == years[0] else "new_codes_json"
+        return row, set(json.loads(row[side]))
+
+    def _validate_issue_input(self, observed_version, group_id, year, form_nos):
+        """Shared validation/selection used by both preview and issuance."""
+        current = self._current_version()
+        if current is None:
+            raise ApiError(409, "a mapping version must exist before issuing vouchers")
+        if len(form_nos) != len(set(form_nos)):
+            raise ApiError(422, {"message": "form_nos must be distinct"})
+        _, target = self._resolve_group(group_id, year)
+
+        rows = {
+            r["form_no"]: r
+            for r in self._conn.execute(
+                "SELECT * FROM forms WHERE form_no IN (%s)"
+                % ",".join("?" for _ in form_nos),
+                form_nos,
+            ).fetchall()
+        }
+        unknown = sorted(no for no in form_nos if no not in rows)
+        if unknown:
+            raise ApiError(
+                422, {"message": "unknown form numbers", "unknown_form_nos": unknown}
+            )
+        wrong_year = sorted(no for no in form_nos if rows[no]["year"] != year)
+        if wrong_year:
+            raise ApiError(
+                422,
+                {
+                    "message": "every form must belong to the requested year",
+                    "wrong_year_form_nos": wrong_year,
+                },
+            )
+
+        active = [
+            (no, set(json.loads(rows[no]["tax_codes_json"])))
+            for no in form_nos
+            if rows[no]["status"] == "active"
+        ]
+        ignored_revoked = sorted(no for no in form_nos if rows[no]["status"] == "revoked")
+
+        # The observed version is checked before the cover so a stale caller
+        # always gets the conflict rather than a misleading cover result.
+        if observed_version != current:
+            raise ApiError(
+                409,
+                {
+                    "message": "observed mapping version has been replaced",
+                    "observed_version": observed_version,
+                    "current_version": current,
+                },
+            )
+
+        selected = _exact_cover(active, target)
+        if selected is None:
+            if ignored_revoked:
+                # Revoked submitted forms are excluded from the candidate pool;
+                # the caller can still retry after replacing them.
+                raise ApiError(
+                    409,
+                    {
+                        "message": "a submitted form was revoked and the remaining forms "
+                        "cannot exactly cover the group",
+                        "revoked_form_nos": ignored_revoked,
+                    },
+                )
+            raise ApiError(
+                422,
+                {
+                    "message": "no subset of the submitted active forms can exactly cover "
+                    "the group's codes without overlap",
+                    "group_id": group_id,
+                    "year": year,
+                },
+            )
+        total = sum(rows[no]["total_cents"] for no in selected)
+        return {
+            "observed_version": observed_version,
+            "group_id": group_id,
+            "year": year,
+            "selected_form_nos": list(selected),
+            "total_cents": total,
+            "ignored_revoked_form_nos": ignored_revoked,
+        }
+
+    def preview_voucher(self, observed_version, group_id, year, form_nos):
+        with self._lock:
+            return self._validate_issue_input(
+                observed_version, group_id, year, form_nos
+            )
+
+    def issue_voucher(self, observed_version, group_id, year, form_nos):
+        with self._lock:
+            result = self._validate_issue_input(
+                observed_version, group_id, year, form_nos
+            )
+            selected = result["selected_form_nos"]
+
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                # Re-check inside the write transaction: anything that changed
+                # between selection and commit aborts the issuance, no voucher.
+                current = self._current_version()
+                if current != observed_version:
+                    raise ApiError(
+                        409,
+                        {
+                            "message": "observed mapping version has been replaced",
+                            "observed_version": observed_version,
+                            "current_version": current,
+                        },
+                    )
+                placeholders = ",".join("?" for _ in selected)
+                picked_rows = self._conn.execute(
+                    f"SELECT form_no, status FROM forms WHERE form_no IN ({placeholders})",
+                    selected,
+                ).fetchall()
+                now_revoked = sorted(
+                    r["form_no"] for r in picked_rows if r["status"] != "active"
+                )
+                if now_revoked:
+                    raise ApiError(
+                        409,
+                        {
+                            "message": "a selected form was revoked before the voucher "
+                            "was written; no voucher generated",
+                            "revoked_form_nos": now_revoked,
+                        },
+                    )
+
+                group_row, target = self._resolve_group(group_id, year)
+                expected_total = (
+                    group_row["old_total_cents"]
+                    if year == self.get_years()[0]
+                    else group_row["new_total_cents"]
+                )
+                if result["total_cents"] != expected_total:
+                    raise ApiError(
+                        422,
+                        {
+                            "message": "selected forms' total does not match the group total",
+                            "selected_total_cents": result["total_cents"],
+                            "group_total_cents": expected_total,
+                        },
+                    )
+
+                next_no = (self._meta_get("next_voucher_no") or 1)
+                voucher_no = f"V{next_no:06d}"
+                issued_at = _now()
+                self._conn.execute(
+                    "INSERT INTO vouchers(voucher_no, version, group_id, year, "
+                    "form_nos_json, total_cents, issued_at) VALUES(?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        voucher_no,
+                        current,
+                        group_id,
+                        year,
+                        json.dumps(selected),
+                        result["total_cents"],
+                        issued_at,
+                    ),
+                )
+                self._meta_set("next_voucher_no", next_no + 1)
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+            return {
+                "voucher_no": voucher_no,
+                "version": current,
+                "issued_at": issued_at,
+                **result,
+            }
+
+    def get_voucher(self, voucher_no):
+        with self._lock:
+            r = self._conn.execute(
+                "SELECT * FROM vouchers WHERE voucher_no = ?", (voucher_no,)
+            ).fetchone()
+            if r is None:
+                raise ApiError(404, f"voucher_no {voucher_no!r} not found")
+            return {
+                "voucher_no": r["voucher_no"],
+                "version": r["version"],
+                "observed_version": r["version"],
+                "group_id": r["group_id"],
+                "year": r["year"],
+                "selected_form_nos": json.loads(r["form_nos_json"]),
+                "total_cents": r["total_cents"],
+                "ignored_revoked_form_nos": [],
+                "issued_at": r["issued_at"],
+            }
+
+    def list_vouchers(self):
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM vouchers ORDER BY voucher_no"
+            ).fetchall()
+            return {"vouchers": [self.get_voucher(r["voucher_no"]) for r in rows]}

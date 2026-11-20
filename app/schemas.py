@@ -1,11 +1,14 @@
 """Pydantic request/response models."""
 from __future__ import annotations
 
-from typing import Annotated, Optional
+from typing import Annotated, Literal, Optional
 
 from pydantic import BaseModel, Field, StringConstraints
 
 Code = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=64)]
+FormNo = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=64)]
+
+MAX_ISSUE_FORMS = 20
 
 
 class BaseAmountIn(BaseModel):
@@ -77,3 +80,65 @@ class VersionInfo(BaseModel):
 class VersionListOut(BaseModel):
     current_version: Optional[int]
     versions: list[VersionInfo]
+
+
+# ------------------------------------------------------------- 核验单 / 凭证
+class FormIn(BaseModel):
+    form_no: FormNo = Field(description="unique verification-form number")
+    year: int = Field(ge=1900, le=2100, description="one of the two base-table years")
+    tax_codes: list[Code] = Field(
+        min_length=1, description="distinct base-table tariff codes covered by this form"
+    )
+    total_cents: int = Field(
+        ge=0, description="total import amount in integer cents; must match the base table"
+    )
+
+
+class FormOut(BaseModel):
+    form_no: str
+    year: int
+    tax_codes: list[str]
+    total_cents: int
+    status: Literal["active", "revoked"]
+    registered_at: str
+    revoked_at: Optional[str] = None
+
+
+class FormListOut(BaseModel):
+    forms: list[FormOut]
+
+
+class IssueIn(BaseModel):
+    observed_version: int = Field(
+        ge=1, description="mapping version the caller saw while selecting forms"
+    )
+    group_id: int = Field(ge=1)
+    year: int = Field(ge=1900, le=2100)
+    form_nos: list[FormNo] = Field(
+        min_length=1,
+        max_length=MAX_ISSUE_FORMS,
+        description="at most 20 registered form numbers to choose from",
+    )
+
+
+class IssueResult(BaseModel):
+    """Result shared by the dry-run preview and the actual issuance."""
+
+    observed_version: int
+    group_id: int
+    year: int
+    selected_form_nos: list[str]
+    total_cents: int
+    ignored_revoked_form_nos: list[str] = Field(
+        description="submitted revoked forms that were excluded; harmless when not needed"
+    )
+
+
+class VoucherOut(IssueResult):
+    voucher_no: str
+    version: int = Field(description="mapping version in effect when the voucher was issued")
+    issued_at: str
+
+
+class VoucherListOut(BaseModel):
+    vouchers: list[VoucherOut]

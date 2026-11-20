@@ -1,6 +1,8 @@
 # 税则税号分组供数 API
 
-新版税则拆并税号后，进口额同比要按**同一组商品**计算。本服务用 FastAPI + SQLite 实现：
+新版税则拆并税号后，进口额同比要按**同一组商品**计算。本服务用 FastAPI + SQLite 实现，
+并在首版对照生效后提供核验单登记/撤销与凭证签发：稽核员交接一组进口额时，可凭最少张
+有效核验单拼出该组当年的完整税号覆盖与合计。
 
 1. `PUT /base` 先固定相邻两年各税号进口额（整数分）；存在对照版本后底表即锁定（409）。
 2. `POST /mappings` 按递增版号提交**完整**新旧税号对照。同号也按年份区分——未变税号
@@ -16,6 +18,14 @@
    版号不高于现行版且不存在 → 409。
 9. 并发改版串行提交，差分以**实际替换的上一版**为准（提交时在读已加写锁的事务内
    重取现行版号）。
+10. **首版对照生效后**开放核验单登记/撤销（`/forms`）：每单填写唯一单号、年份、
+    税号清单和合计金额（整数分），合计须与底表相符，否则 422 整单拒收；撤销为
+    软删除，原单保留并带 `revoked_at`。
+11. 凭证签发（`/vouchers`）传所见对照版、组号、年份和至多 20 个已登记单号：
+    从**有效单**中选**最少张**，每张整用、税号互不重叠且恰好覆盖该组当年成员；
+    拼不齐返回 422（提交单中含已撤销单导致拼不齐返回 409）。选单期间可继续换版、撤单。
+12. 写入凭证时在写事务内重读：所见版已被替换或入选单已撤销 → 409 冲突且不生成凭证；
+    未入选单撤销不影响签发。凭号可查签发时版号、组号、年份、所用单号和合计。
 
 ## 启动
 
@@ -76,6 +86,33 @@ python -m pytest tests/ -q             # 跑测试
    把 entries 改掉再传 version=1 → 409。
 7. **拒收** —— version=3 漏掉 `D` → 422 列出 `missing_old_codes`/`missing_new_codes`，
    `GET /summary` 仍是 v2。
+8. **核验单 / `POST /forms`** —— 首版生效后登记（合计必须等于底表金额之和）：
+
+   ```json
+   {"form_no":"F-C","year":2023,"tax_codes":["C"],"total_cents":300}
+   {"form_no":"F-D","year":2023,"tax_codes":["D"],"total_cents":400}
+   {"form_no":"F-CD","year":2023,"tax_codes":["C","D"],"total_cents":700}
+   {"form_no":"F-CD24","year":2024,"tax_codes":["C","D"],"total_cents":720}
+   ```
+
+   再传一个金额不符的单（如 `total_cents=999`）→ 422 且带 `expected_total_cents`；
+   单号重复 → 409。
+9. **预演 / `POST /vouchers/preview`** —— 传所见版、组号、年份和候选单号，返回最少张
+   选单结果但不写凭证：
+
+   ```json
+   {"observed_version":1,"group_id":3,"year":2023,
+    "form_nos":["F-C","F-D","F-CD"]}
+   ```
+
+   返回 `selected_form_nos=["F-CD"]`（一张优于两张）。只给拼不齐的候选 → 422。
+10. **签发 / `POST /vouchers`** —— 同样的请求体正式签发，返回凭号 `V000001`、
+    签发版号、所用单号与合计；`GET /vouchers/V000001` 可回查全部内容。
+11. **撤单/签发交错** —— `POST /forms/F-C/revoke` 撤销未入选单后，仍可用 `F-CD`
+    签发（响应里 `ignored_revoked_form_nos` 列出被忽略的撤销单）；再撤销入选所需的
+    `F-CD` 后签发 → 409 且 `GET /vouchers` 中无新凭证。
+12. **换版冲突** —— 提交 v2 拆组后，仍以 `observed_version=1` 签发 → 409/422 且不落
+    凭证；改用现行版号与现存组号后才能签发。
 
 也可以用脚本一键演示同样流程：`./scripts/demo.sh`（需服务已启动）。
 
@@ -90,6 +127,14 @@ python -m pytest tests/ -q             # 跑测试
 | GET | `/versions` | 版本列表与现行版号 |
 | GET | `/summary` | 现行汇总：组号、两侧税号、各年合计 |
 | GET | `/changes/{version}` | 按版取供数变更（首版全量） |
+| POST | `/forms` | 登记核验单；金额与底表不符/税号未知/重复 → 422，单号重复 → 409 |
+| POST | `/forms/{form_no}/revoke` | 撤销核验单（软删除，原单保留；重复撤销幂等） |
+| GET | `/forms` | 核验单列表，可按 `status=active|revoked` 过滤 |
+| GET | `/forms/{form_no}` | 按单号查核验单（含已撤销） |
+| POST | `/vouchers/preview` | 预演最少张精确覆盖选单，不写凭证 |
+| POST | `/vouchers` | 签发凭证；版被换/入选单被撤 → 409，拼不齐 → 422 |
+| GET | `/vouchers` | 已签发凭证列表 |
+| GET | `/vouchers/{voucher_no}` | 按凭号查版号、组号、年份、所用单号、合计 |
 
 变更记录结构：
 
@@ -111,17 +156,28 @@ python -m pytest tests/ -q             # 跑测试
   上一版为准。
 - **幂等/冲突**：每版保存对照内容哈希；同版同哈希直接回放当时存的变更记录，
   不同哈希 409。
-- **持久化**：`versions` / `changes` / `current_groups` / `meta` 全在 SQLite 文件中，
-  重启后按版取变更、现行汇总、重传幂等全部保留。
+- **持久化**：`versions` / `changes` / `current_groups` / `meta` / `forms` / `vouchers`
+  全在 SQLite 文件中，重启后按版取变更、现行汇总、重传幂等、核验单与凭证全部保留；
+  凭号取自持久化计数器（`V000001` 起，单调不复用）。
+- **核验单**：登记在写事务内核对底表——年份须属于底表两年、税号存在且互不重复、
+  合计等于底表金额之和；撤销只把状态置为 `revoked` 并记录时间，行不删除。
+- **精确覆盖选单**：把每张候选单视为该年税号集合的一个子集，用 DFS 求**最小精确
+  覆盖**（分支于一个未覆盖代表税号，剔除与已选重叠的单）；先按张数最少、再按单号
+  字典序决胜，结果确定。候选仅限有效单，撤销单在进入选择前即被剔除。
+- **签发一致性**：选择与写入共用同一把进程锁；写入在 `BEGIN IMMEDIATE` 事务内重读
+  现行版号与入选单状态，任一失效即回滚并返回 409，绝不生成半成品凭证。
+- **冲突分级**：所见版被替换、入选单在写入前被撤 → 409（调用方刷新后可重试）；
+  组号不存在、年份/单号非法、有效单本身拼不齐 → 422（数据不满足签发条件）。
 
 ## 目录
 
 ```
 app/
   main.py      # FastAPI 路由与 App 工厂（DB_PATH 环境变量）
-  store.py     # SQLite 持久化 + 分组/差分/校验领域逻辑
-  schemas.py   # Pydantic 模型
-tests/test_api.py
+  store.py     # SQLite 持久化 + 分组/差分/校验/精确覆盖选单领域逻辑
+  schemas.py   # Pydantic 模型（含核验单、凭证）
+tests/test_api.py            # 底表/对照/供数基线测试
+tests/test_forms_vouchers.py # 核验单登记撤销与凭证签发测试（含并发、重启）
 scripts/demo.sh
 Dockerfile / docker-compose.yml
 requirements.txt / requirements-dev.txt
